@@ -814,7 +814,7 @@ def filter_entity(
     """
 
     def decorator(f: FilterEntityFunc) -> FilterEntityFunc:
-        _filter_entity_funcs.append(StylerRegistration(priority, formats, tags, f))
+        _register_filter_entity(priority=priority, func=f, formats=formats, tags=tags)
         return f
 
     if func is None:
@@ -822,6 +822,33 @@ def filter_entity(
         return decorator
     # Called without arguments: @filter_entity
     return decorator(func)
+
+
+def _register_filter_entity(
+    *,
+    priority: int,
+    func: FilterEntityFunc,
+    formats: list[str] | None = None,
+    tags: list[str] | None = None,
+) -> StylerRegistration[FilterEntityFunc]:
+    """Register an entity filter function and return its registration token.
+
+    The token can be passed to ``_unregister_filter_entity`` to remove the filter.
+    """
+    reg: StylerRegistration[FilterEntityFunc] = StylerRegistration(priority, formats, tags, func)
+    _filter_entity_funcs.append(reg)
+    return reg
+
+
+def _unregister_filter_entity(token: StylerRegistration[FilterEntityFunc]) -> None:
+    """Remove a previously registered entity filter by its token (identity match).
+
+    Silent no-op if token is absent (e.g., registry was cleared between register and unregister).
+    """
+    for i, reg in enumerate(_filter_entity_funcs):
+        if reg is token:
+            del _filter_entity_funcs[i]
+            return
 
 
 # ============================================================================

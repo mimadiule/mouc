@@ -6,12 +6,12 @@ import csv
 import importlib
 import importlib.util
 import sys
-from collections.abc import Sequence
-from contextlib import suppress
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 
 import typer
 from ruamel.yaml import YAML
@@ -37,6 +37,7 @@ from .scheduler import (
     SchedulingService,
 )
 from .scheduler.lock import read_lock_file, write_lock_file
+from .tag_filter import TagFilterSpec, parse_tag_options, select_entities, selection_is_empty
 from .unified_config import GanttConfig, load_unified_config
 
 app = typer.Typer(
@@ -119,7 +120,24 @@ def graph(  # noqa: PLR0913 - CLI command needs multiple options
     target: Annotated[
         str | None, typer.Option("--target", "-t", help="Target for critical path view")
     ] = None,
-    tags: Annotated[list[str] | None, typer.Option("--tags", help="Tags for filtered view")] = None,
+    tags: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--tags",
+            help=(
+                "Filter to entities tagged with any of TAGS (comma-separated or repeated). "
+                "Prefix `!` to exclude. Includes all transitive upstream and downstream "
+                "dependencies. Combine with --style-tags for style-function activation."
+            ),
+        ),
+    ] = None,
+    tags_direction: Annotated[
+        str,
+        typer.Option(
+            "--tags-direction",
+            help="Limit closure direction: both | up | down (default: both)",
+        ),
+    ] = "both",
     output: Annotated[Path | None, typer.Option("--output", "-o", help="Output file path")] = None,
     style_module: Annotated[
         str | None,
@@ -151,6 +169,12 @@ def graph(  # noqa: PLR0913 - CLI command needs multiple options
         typer.echo("Error: Cannot specify both --style-module and --style-file", err=True)
         raise typer.Exit(1)
 
+    # Parse tag filter spec; for --view filtered, reject empty or negation-only specs.
+    spec = _resolve_tag_filter(tags, tags_direction)
+    if view == GraphView.FILTERED and len(spec.include) == 0:
+        typer.echo("Error: --view filtered requires at least one positive --tags token", err=True)
+        raise typer.Exit(1)
+
     # Load styling module if specified
     if style_module or style_file:
         _load_styling(style_module, style_file)
@@ -166,9 +190,33 @@ def graph(  # noqa: PLR0913 - CLI command needs multiple options
         feature_map, output_format="graph", style_tags=active_style_tags
     )
 
-    # Generate the graph
-    generator = GraphGenerator(feature_map, styling_context)
-    dot_output = generator.generate(view, target=target, tags=tags)
+    # For --view filtered: install a negation-only ephemeral filter (removes excluded entities
+    # from base_entities before _generate_filtered runs), then forward only positive tags.
+    # For all other views: install the full closure-based ephemeral filter.
+    graph_tags: list[str] | None = tags
+    if view == GraphView.FILTERED and not spec.is_empty:
+        # TODO(unify-filtered-view-warning): this inline check diverges from _select_tag_entities.
+        # Future special-cased views that bypass _apply_tag_filter must duplicate and maintain it.
+        # Emit empty-match warning when no entities survive both positive-tag match and negation.
+        if spec.include and not any(
+            (set(e.tags) & spec.include) and not (set(e.tags) & spec.exclude)
+            for e in feature_map.entities
+        ):
+            typer.echo("warning: --tags matched no entities", err=True)
+        # Negation-only filter: exclude tagged entities; positive tags forwarded as-is.
+        excl = spec.exclude
+        negation_ids = (
+            {e.id for e in feature_map.entities if not (set(e.tags) & excl)} if excl else None
+        )
+        graph_tags = list(spec.include) or None
+        with _install_ephemeral_filter(negation_ids):
+            generator = GraphGenerator(feature_map, styling_context)
+            dot_output = generator.generate(view, target=target, tags=graph_tags)
+    else:
+        with _apply_tag_filter(feature_map, spec):
+            # Generate the graph
+            generator = GraphGenerator(feature_map, styling_context)
+            dot_output = generator.generate(view, target=target, tags=graph_tags)
 
     # Output the result
     if output:
@@ -210,6 +258,24 @@ def doc(  # noqa: PLR0913, PLR0912, PLR0915 - CLI command needs multiple options
             help="Use pre-computed schedule from lock file",
         ),
     ] = None,
+    tags: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--tags",
+            help=(
+                "Filter to entities tagged with any of TAGS (comma-separated or repeated). "
+                "Prefix `!` to exclude. Includes all transitive upstream and downstream "
+                "dependencies. Combine with --style-tags for style-function activation."
+            ),
+        ),
+    ] = None,
+    tags_direction: Annotated[
+        str,
+        typer.Option(
+            "--tags-direction",
+            help="Limit closure direction: both | up | down (default: both)",
+        ),
+    ] = "both",
     style_module: Annotated[
         str | None,
         typer.Option("--style-module", help="Python module path for styling functions"),
@@ -301,22 +367,24 @@ def doc(  # noqa: PLR0913, PLR0912, PLR0915 - CLI command needs multiple options
     # Collect style tags from CLI and config
     active_style_tags = _collect_style_tags(style_tags, file)
 
-    # Generate the documentation
-    styling_context = styling.create_styling_context(
-        feature_map, output_format=format, style_tags=active_style_tags
-    )
+    spec = _resolve_tag_filter(tags, tags_direction)
+    with _apply_tag_filter(feature_map, spec):
+        # Generate the documentation
+        styling_context = styling.create_styling_context(
+            feature_map, output_format=format, style_tags=active_style_tags
+        )
 
-    # Select backend and config based on format
-    if format == "docx":
-        doc_config = unified_config.docx if unified_config else None
-        table_style = doc_config.table_style if doc_config else "Table Grid"
-        backend = DocxBackend(feature_map, styling_context, table_style)
-    else:
-        backend = MarkdownBackend(feature_map, styling_context)
-        doc_config = unified_config.markdown if unified_config else None
+        # Select backend and config based on format
+        if format == "docx":
+            doc_config = unified_config.docx if unified_config else None
+            table_style = doc_config.table_style if doc_config else "Table Grid"
+            backend = DocxBackend(feature_map, styling_context, table_style)
+        else:
+            backend = MarkdownBackend(feature_map, styling_context)
+            doc_config = unified_config.markdown if unified_config else None
 
-    generator = DocumentGenerator(feature_map, backend, doc_config, unified_config)
-    doc_output = generator.generate()
+        generator = DocumentGenerator(feature_map, backend, doc_config, unified_config)
+        doc_output = generator.generate()
 
     # Output the result
     if output:
@@ -495,6 +563,24 @@ def gantt(  # noqa: PLR0913, PLR0912, PLR0915 - CLI command needs multiple optio
         Path | None,
         typer.Option("--style-file", help="Python file path for styling functions"),
     ] = None,
+    tags: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--tags",
+            help=(
+                "Filter to entities tagged with any of TAGS (comma-separated or repeated). "
+                "Prefix `!` to exclude. Includes all transitive upstream and downstream "
+                "dependencies. Combine with --style-tags for style-function activation."
+            ),
+        ),
+    ] = None,
+    tags_direction: Annotated[
+        str,
+        typer.Option(
+            "--tags-direction",
+            help="Limit closure direction: both | up | down (default: both)",
+        ),
+    ] = "both",
     style_tags: Annotated[
         str | None,
         typer.Option(
@@ -591,6 +677,10 @@ def gantt(  # noqa: PLR0913, PLR0912, PLR0915 - CLI command needs multiple optio
     # Collect style tags from CLI and config
     active_style_tags = _collect_style_tags(style_tags, file)
 
+    # Parse tag filter; scheduling runs over the full entity set (requirement A3).
+    # The ephemeral filter is installed after scheduling.
+    spec = _resolve_tag_filter(tags, tags_direction)
+
     # Create GanttScheduler (needed for Mermaid generation regardless of scheduling mode)
     scheduler = GanttScheduler(
         feature_map,
@@ -632,26 +722,29 @@ def gantt(  # noqa: PLR0913, PLR0912, PLR0915 - CLI command needs multiple optio
     else:
         result = scheduler.schedule()
 
-    # Create anchor function for markdown links if needed
-    anchor_fn = None
-    if final_markdown_url:
-        styling_context = styling.create_styling_context(
-            feature_map, output_format="gantt", style_tags=active_style_tags
-        )
-        backend = MarkdownBackend(feature_map, styling_context)
-        anchor_fn = backend.make_anchor
+    # Install ephemeral tag filter after scheduling so rendering is restricted
+    # but scheduled dates reflect the full entity graph.
+    with _apply_tag_filter(feature_map, spec):
+        # Create anchor function for markdown links if needed
+        anchor_fn = None
+        if final_markdown_url:
+            styling_context = styling.create_styling_context(
+                feature_map, output_format="gantt", style_tags=active_style_tags
+            )
+            backend = MarkdownBackend(feature_map, styling_context)
+            anchor_fn = backend.make_anchor
 
-    # Generate Mermaid chart
-    mermaid_output = scheduler.generate_mermaid(
-        result,
-        title=title,
-        tick_interval=tick_interval,
-        axis_format=axis_format,
-        vertical_dividers=vertical_dividers,
-        compact=compact,
-        markdown_base_url=final_markdown_url,
-        anchor_fn=anchor_fn,
-    )
+        # Generate Mermaid chart
+        mermaid_output = scheduler.generate_mermaid(
+            result,
+            title=title,
+            tick_interval=tick_interval,
+            axis_format=axis_format,
+            vertical_dividers=vertical_dividers,
+            compact=compact,
+            markdown_base_url=final_markdown_url,
+            anchor_fn=anchor_fn,
+        )
 
     # Output the result
     _format_gantt_output(mermaid_output, output)
@@ -663,9 +756,20 @@ def gantt(  # noqa: PLR0913, PLR0912, PLR0915 - CLI command needs multiple optio
             typer.echo(f"  - {warning}", err=True)
 
 
-def _annotate_feature_map(feature_map: FeatureMap, result: SchedulingResult, file: Path) -> None:
+def _annotate_feature_map(
+    feature_map: FeatureMap,
+    result: SchedulingResult,
+    file: Path,
+    active_style_tags: set[str] | None = None,
+) -> None:
     """Write schedule annotations back to feature map YAML file."""
-    for entity in feature_map.entities:
+    annotate_context = styling.create_styling_context(
+        feature_map, output_format="schedule", style_tags=active_style_tags or set()
+    )
+    annotate_entities = cast(
+        list[Entity], styling.apply_entity_filters(feature_map.entities, annotate_context)
+    )
+    for entity in annotate_entities:
         if entity.id in result.annotations:
             annot = result.annotations[entity.id]
             if annot.estimated_start:
@@ -677,13 +781,24 @@ def _annotate_feature_map(feature_map: FeatureMap, result: SchedulingResult, fil
     typer.echo(f"Annotations written to {file}")
 
 
-def _display_schedule_results(feature_map: FeatureMap, result: SchedulingResult) -> None:
+def _display_schedule_results(
+    feature_map: FeatureMap,
+    result: SchedulingResult,
+    active_style_tags: set[str] | None = None,
+) -> None:
     """Display schedule results to stdout."""
     typer.echo("Schedule Results")
     typer.echo("=" * 80)
     typer.echo("")
 
-    for entity in feature_map.entities:
+    display_context = styling.create_styling_context(
+        feature_map, output_format="schedule", style_tags=active_style_tags or set()
+    )
+    display_entities = cast(
+        list[Entity], styling.apply_entity_filters(feature_map.entities, display_context)
+    )
+
+    for entity in display_entities:
         if entity.id not in result.annotations:
             continue
 
@@ -762,9 +877,29 @@ def schedule(  # noqa: PLR0913, PLR0912, PLR0915 - CLI command needs multiple op
         Path | None,
         typer.Option(
             "--output-csv",
-            help="Export schedule results to CSV file for scenario comparison",
+            help="Export schedule results to CSV file for scenario comparison. Always reflects the full scheduled set regardless of --tags.",
         ),
     ] = None,
+    tags: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--tags",
+            help=(
+                "Filter displayed entities to those tagged with any of TAGS "
+                "(comma-separated or repeated). Prefix `!` to exclude. Includes all transitive "
+                "upstream and downstream dependencies. Scheduling considers the full entity graph; "
+                "only output is restricted. Lock files always reflect the full schedule. "
+                "Combine with --style-tags for style-function activation."
+            ),
+        ),
+    ] = None,
+    tags_direction: Annotated[
+        str,
+        typer.Option(
+            "--tags-direction",
+            help="Limit closure direction: both | up | down (default: both)",
+        ),
+    ] = "both",
     style_tags: Annotated[
         str | None,
         typer.Option(
@@ -796,6 +931,15 @@ def schedule(  # noqa: PLR0913, PLR0912, PLR0915 - CLI command needs multiple op
     ] = None,
 ) -> None:
     """Run scheduling algorithm and display or persist results."""
+    if tags and annotate_yaml:
+        typer.echo(
+            "Error: --tags and --annotate-yaml cannot be combined; "
+            "--annotate-yaml writes only the filtered entity subset, leaving other "
+            "entities with stale annotations. Omit --tags to annotate all entities.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
     # Parse current date if provided
     parsed_current_date = _parse_date_option(current_date, "current-date")
 
@@ -808,6 +952,10 @@ def schedule(  # noqa: PLR0913, PLR0912, PLR0915 - CLI command needs multiple op
 
     # Load the feature map
     feature_map = load_feature_map(file)
+
+    # Compute selected_ids from full feature map before any style-tag filter.
+    spec = _resolve_tag_filter(tags, tags_direction)
+    selected_ids = _select_tag_entities(feature_map, spec)
 
     # Load schedule lock file if specified
     schedule_lock = None
@@ -854,7 +1002,7 @@ def schedule(  # noqa: PLR0913, PLR0912, PLR0915 - CLI command needs multiple op
             scheduler_config = SchedulingConfig()
         scheduler_config.implementation = ImplementationType.RUST
 
-    # Filter entities if style-tags specified (locked entities are always included)
+    # --style-tags pre-schedule filter (locked entities always included).
     active_style_tags = _collect_style_tags(style_tags, file)
     if active_style_tags:
         styling_context = styling.create_styling_context(
@@ -870,7 +1018,7 @@ def schedule(  # noqa: PLR0913, PLR0912, PLR0915 - CLI command needs multiple op
         # Create filtered feature map for scheduling
         feature_map = replace(feature_map, entities=filtered_entities)
 
-    # Run scheduling service
+    # Run scheduling service.
     service = SchedulingService(
         feature_map,
         parsed_current_date,
@@ -881,28 +1029,30 @@ def schedule(  # noqa: PLR0913, PLR0912, PLR0915 - CLI command needs multiple op
     )
     result = service.schedule()
 
-    # Display or persist results
-    if output_csv:
-        # Apply CSV-specific output filters
-        csv_context = styling.create_styling_context(
-            feature_map, output_format="csv", style_tags=active_style_tags
-        )
-        csv_entities = cast(
-            list[Entity], styling.apply_entity_filters(feature_map.entities, csv_context)
-        )
-        default_priority = (
-            scheduler_config.default_priority
-            if scheduler_config
-            else SchedulingConfig().default_priority
-        )
-        _export_schedule_csv(csv_entities, result, output_csv, default_priority)
-        typer.echo(f"Schedule exported to {output_csv}")
-    elif annotate_yaml:
-        _annotate_feature_map(feature_map, result, file)
-    else:
-        _display_schedule_results(feature_map, result)
+    # Install post-schedule --tags filter (display only).
+    with _install_ephemeral_filter(selected_ids):
+        # Display / CSV / annotate paths.
+        if output_csv:
+            # Apply CSV-specific output filters
+            csv_context = styling.create_styling_context(
+                feature_map, output_format="csv", style_tags=active_style_tags
+            )
+            csv_entities = cast(
+                list[Entity], styling.apply_entity_filters(feature_map.entities, csv_context)
+            )
+            default_priority = (
+                scheduler_config.default_priority
+                if scheduler_config
+                else SchedulingConfig().default_priority
+            )
+            _export_schedule_csv(csv_entities, result, output_csv, default_priority)
+            typer.echo(f"Schedule exported to {output_csv}")
+        elif annotate_yaml:
+            _annotate_feature_map(feature_map, result, file, active_style_tags)
+        else:
+            _display_schedule_results(feature_map, result, active_style_tags)
 
-    # Export lock file if requested
+    # Lock files always reflect the full schedule (not the filtered set).
     if output_lock:
         write_lock_file(output_lock, result)
         typer.echo(f"Lock file written to {output_lock}")
@@ -1116,6 +1266,71 @@ app.add_typer(jira_app, name="jira")
 
 # Register report subcommands (defined in report_cli.py)
 app.add_typer(report_app, name="report")
+
+
+def _resolve_tag_filter(
+    tags: list[str] | None,
+    direction: str = "both",
+) -> TagFilterSpec:
+    """Parse CLI --tags and --tags-direction into a TagFilterSpec."""
+    dir_val: Literal["both", "up", "down"] = "both"
+    if direction == "up":
+        dir_val = "up"
+    elif direction == "down":
+        dir_val = "down"
+    elif direction != "both":
+        typer.echo(
+            f"Error: Invalid --tags-direction value '{direction}'. Must be one of: both, up, down",
+            err=True,
+        )
+        raise typer.Exit(1)
+    try:
+        return parse_tag_options(tags, direction=dir_val)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1) from None
+
+
+def _select_tag_entities(feature_map: FeatureMap, spec: TagFilterSpec) -> set[str] | None:
+    """Select entities per spec and emit warning if empty. Return selected IDs or None."""
+    if spec.is_empty:
+        return None
+    selected = select_entities(feature_map, spec)
+    if selection_is_empty(selected, spec):
+        typer.echo("warning: --tags matched no entities", err=True)
+    return {e.id for e in selected}
+
+
+@contextmanager
+def _install_ephemeral_filter(
+    selected_ids: set[str] | None,
+) -> Generator[None, None, None]:
+    """Context manager that installs an ephemeral entity filter for ``selected_ids``.
+
+    No-op when ``selected_ids`` is None (empty spec). Unregisters on exit.
+    """
+    if selected_ids is None:
+        yield
+        return
+    token = styling._register_filter_entity(  # pyright: ignore[reportPrivateUsage]
+        priority=-1000,
+        func=lambda entities, _ctx: [e for e in entities if e.id in selected_ids],
+    )
+    try:
+        yield
+    finally:
+        styling._unregister_filter_entity(token)  # pyright: ignore[reportPrivateUsage]
+
+
+@contextmanager
+def _apply_tag_filter(
+    feature_map: FeatureMap,
+    spec: TagFilterSpec,
+) -> Generator[None, None, None]:
+    """Context manager that selects entities, emits empty-match warning, and installs ephemeral filter."""
+    selected_ids = _select_tag_entities(feature_map, spec)
+    with _install_ephemeral_filter(selected_ids):
+        yield
 
 
 def _load_styling(style_module: str | None, style_file: Path | None) -> None:

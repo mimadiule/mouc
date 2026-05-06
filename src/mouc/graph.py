@@ -104,6 +104,13 @@ class GraphGenerator:
         dependencies = self._find_all_dependencies(target)
         dependencies.add(target)
 
+        # Intersect with post-filter entity IDs so excluded ancestors don't render.
+        entity_ids = {e.id for e in entities}
+        # TODO(critical-path-filter-empty-warning): if target not in entity_ids after
+        # intersection, emit "warning: --tags matched no entities" so the user knows why
+        # the output is empty (target itself is excluded by --tags).
+        dependencies = dependencies & entity_ids
+
         lines = ["digraph CriticalPath {"]
         lines.append("  rankdir=LR;")
         lines.append("  node [shape=oval];")
@@ -145,6 +152,10 @@ class GraphGenerator:
         expanded_ids: set[str] = matching_ids.copy()
         for node_id in matching_ids:
             expanded_ids.update(self._find_direct_connections(node_id))
+
+        # Intersect with post-filter entity IDs so negated one-hop neighbors are dropped.
+        entity_ids = {e.id for e in entities}
+        expanded_ids = expanded_ids & entity_ids
 
         lines = ["digraph FilteredView {"]
         lines.append("  rankdir=LR;")

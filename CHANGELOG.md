@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-05-06
+
+### Fixed
+- `mouc graph --tags` now actually filters output (previously ignored).
+
+### Changed
+- `--tags` filter behavior unified across `graph`, `doc`, `gantt`, `schedule`: shared grammar with include/exclude (`!tag`) and configurable closure direction (`--tags-direction up|down|both`).
+
 ## [0.7.5] - 2026-01-29
 
 ### Fixed
