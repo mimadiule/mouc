@@ -446,7 +446,7 @@ mouc gantt --style-file my_gantt_styles.py --output schedule.md
 - `group_tasks` returns dict mapping section names to task lists
 - Dict insertion order controls section display order
 - `sort_tasks` applies within each group
-- Use `formats=['gantt']` to scope to gantt output only
+- Use `formats=['gantt']` to scope to gantt output only — without it, a `group_tasks` function also defines `mouc graph` clusters (see [Styling documentation](styling.md#grouping-gantt-sections-and-graph-clusters))
 
 See the [Styling documentation](styling.md) for more details on styling functions.
 

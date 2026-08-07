@@ -11,6 +11,10 @@ if TYPE_CHECKING:
     from .models import Entity, FeatureMap
 
 
+FILLED_CLUSTER_STYLE = ["style=filled;", "fillcolor=lightgrey;"]
+DASHED_CLUSTER_STYLE = ["style=dashed;"]
+
+
 class GraphView(Enum):
     """Types of graph views available."""
 
@@ -71,6 +75,75 @@ class GraphGenerator:
             return self._generate_timeframe_colored(base_entities)
         raise ValueError(f"Unknown view: {view}")
 
+    def _emit_nodes(
+        self,
+        entities: list[Entity],
+        override_styles: dict[str, dict[str, Any]] | None = None,
+    ) -> list[str]:
+        """Emit node definition lines, grouped into clusters per the active grouping function.
+
+        Args:
+            entities: Entities to emit, in the order they should be considered
+            override_styles: Optional map of entity ID to per-node style overrides
+
+        Returns:
+            DOT lines: top-level node definitions for the None group, and one
+            `subgraph cluster_<idx>` block per named group.
+        """
+        groups = cast(
+            "dict[str | None, list[Entity]]",
+            styling.apply_task_grouping(entities, self.styling_context),
+        )
+
+        lines: list[str] = []
+        cluster_idx = 0
+        for key, group in groups.items():
+            if key is None:
+                for entity in group:
+                    lines.append(f"  {self._format_node_with_overrides(entity, override_styles)}")
+                continue
+
+            lines.extend(
+                self._emit_cluster(
+                    cluster_idx,
+                    key,
+                    [self._format_node_with_overrides(entity, override_styles) for entity in group],
+                    FILLED_CLUSTER_STYLE,
+                )
+            )
+            cluster_idx += 1
+
+        return lines
+
+    def _emit_cluster(
+        self, index: int, label: str, node_defs: list[str], style_lines: list[str]
+    ) -> list[str]:
+        """Emit one `subgraph cluster_<index>` block wrapping the given node definitions.
+
+        Args:
+            index: Sequential cluster index, keeping the DOT cluster id safe for any label
+            label: Cluster label, escaped before emission
+            node_defs: Formatted node definition lines to place inside the box
+            style_lines: DOT attribute statements styling the box
+
+        Returns:
+            DOT lines for the cluster block, followed by a blank separator line.
+        """
+        lines = [f"  subgraph cluster_{index} {{", f'    label="{self._escape_label(label)}";']
+        lines.extend(f"    {style_line}" for style_line in style_lines)
+        lines.append("")
+        lines.extend(f"    {node_def}" for node_def in node_defs)
+        lines.append("  }")
+        lines.append("")
+        return lines
+
+    def _format_node_with_overrides(
+        self, entity: Entity, override_styles: dict[str, dict[str, Any]] | None
+    ) -> str:
+        """Format a node, applying this entity's override style if one is present."""
+        override = override_styles.get(entity.id) if override_styles else None
+        return self._format_node(entity, override_style=override)
+
     def _generate_all(self, entities: list[Entity]) -> str:
         """Generate a complete graph with all entities."""
         # Build set of entity IDs in the filtered set for edge filtering
@@ -81,10 +154,7 @@ class GraphGenerator:
         lines.append("  node [shape=oval];")
         lines.append("")
 
-        # Add all entities
-        for entity in entities:
-            node_def = self._format_node(entity)
-            lines.append(f"  {node_def}")
+        lines.extend(self._emit_nodes(entities))
         lines.append("")
 
         # Add edges (unblocks direction) - only if both endpoints are in the filtered set
@@ -116,15 +186,7 @@ class GraphGenerator:
         lines.append("  node [shape=oval];")
         lines.append("")
 
-        # Add all nodes in the critical path
-        for node_id in dependencies:
-            entity = self.feature_map.get_entity_by_id(node_id)
-            if not entity:
-                continue
-
-            node_def = self._format_node(entity)
-            lines.append(f"  {node_def}")
-
+        lines.extend(self._emit_nodes([e for e in entities if e.id in dependencies]))
         lines.append("")
 
         # Add edges only for nodes in the critical path (unblocks direction)
@@ -162,15 +224,7 @@ class GraphGenerator:
         lines.append("  node [shape=oval];")
         lines.append("")
 
-        # Add nodes
-        for node_id in expanded_ids:
-            entity = self.feature_map.get_entity_by_id(node_id)
-            if not entity:
-                continue
-
-            node_def = self._format_node(entity)
-            lines.append(f"  {node_def}")
-
+        lines.extend(self._emit_nodes([e for e in entities if e.id in expanded_ids]))
         lines.append("")
 
         # Add edges (unblocks direction)
@@ -216,7 +270,7 @@ class GraphGenerator:
 
     def _escape_label(self, label: str) -> str:
         """Escape special characters in DOT labels."""
-        return label.replace('"', '\\"').replace("\n", "\\n")
+        return label.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
     def _format_node(self, entity: Entity, override_style: dict[str, Any] | None = None) -> str:
         """Format a node with styling applied."""
@@ -306,34 +360,26 @@ class GraphGenerator:
         # Create subgraph clusters for each timeframe
         cluster_idx = 0
         for timeframe in sorted_timeframes:
-            lines.append(f"  subgraph cluster_{cluster_idx} {{")
-            lines.append(f'    label="{self._escape_label(timeframe)}";')
-            lines.append("    style=filled;")
-            lines.append("    fillcolor=lightgrey;")
-            lines.append("")
-
-            # Add entities in this timeframe
-            for entity in timeframe_groups[timeframe]:
-                node_def = self._format_node(entity)
-                lines.append(f"    {node_def}")
-
-            lines.append("  }")
-            lines.append("")
+            lines.extend(
+                self._emit_cluster(
+                    cluster_idx,
+                    timeframe,
+                    [self._format_node(entity) for entity in timeframe_groups[timeframe]],
+                    FILLED_CLUSTER_STYLE,
+                )
+            )
             cluster_idx += 1
 
         # Add unscheduled entities if any
         if unscheduled:
-            lines.append(f"  subgraph cluster_{cluster_idx} {{")
-            lines.append('    label="Unscheduled";')
-            lines.append("    style=dashed;")
-            lines.append("")
-
-            for entity in unscheduled:
-                node_def = self._format_node(entity)
-                lines.append(f"    {node_def}")
-
-            lines.append("  }")
-            lines.append("")
+            lines.extend(
+                self._emit_cluster(
+                    cluster_idx,
+                    "Unscheduled",
+                    [self._format_node(entity) for entity in unscheduled],
+                    DASHED_CLUSTER_STYLE,
+                )
+            )
 
         # Build set of entity IDs in the filtered set for edge filtering
         entity_ids = {e.id for e in entities}
@@ -385,12 +431,10 @@ class GraphGenerator:
         lines.append("  node [shape=oval];")
         lines.append("")
 
-        # Add all nodes with colors based on timeframe
-        for entity in entities:
-            color = entity_colors.get(entity.id, "white")
-            node_def = self._format_node(entity, override_style={"fill_color": color})
-            lines.append(f"  {node_def}")
-
+        override_styles = {
+            entity.id: {"fill_color": entity_colors.get(entity.id, "white")} for entity in entities
+        }
+        lines.extend(self._emit_nodes(entities, override_styles=override_styles))
         lines.append("")
 
         # Build set of entity IDs in the filtered set for edge filtering

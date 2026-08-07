@@ -1,11 +1,14 @@
 """Tests for task organization (grouping and sorting) functionality."""
 
-# pyright: reportUnusedFunction=false
+# pyright: reportUnusedFunction=false, reportPrivateUsage=false
 
 from collections.abc import Sequence
 from datetime import date
 
-from mouc import styling
+import pytest
+
+from mouc import builtin_gantt, styling
+from mouc.builtin_gantt import register_builtin_organization
 from mouc.gantt import GanttScheduler
 from mouc.models import Entity, FeatureMap, FeatureMapMetadata
 from mouc.styling import Entity as EntityProtocol
@@ -592,3 +595,48 @@ def test_clear_registrations_clears_organization_functions() -> None:
 
     # Should have no grouping (default behavior)
     assert "section" not in mermaid
+
+
+class TestBuiltinOrganizationLookupTables:
+    """Test that every config value binds to the intended built-in function."""
+
+    @pytest.mark.parametrize(
+        ("group_by", "expected"),
+        [
+            ("type", builtin_gantt._builtin_group_by_type),
+            ("resource", builtin_gantt._builtin_group_by_resource),
+            ("timeframe", builtin_gantt._builtin_group_by_timeframe),
+        ],
+    )
+    def test_group_by_registers_expected_func(
+        self, group_by: str, expected: styling.GroupTasksFunc
+    ) -> None:
+        register_builtin_organization(group_by, None)
+
+        assert [reg.func for reg in styling._group_tasks_funcs] == [expected]
+        assert styling._sort_tasks_funcs == []
+
+    @pytest.mark.parametrize(
+        ("sort_by", "expected"),
+        [
+            ("start", builtin_gantt._builtin_sort_by_start),
+            ("end", builtin_gantt._builtin_sort_by_end),
+            ("deadline", builtin_gantt._builtin_sort_by_deadline),
+            ("name", builtin_gantt._builtin_sort_by_name),
+            ("priority", builtin_gantt._builtin_sort_by_priority),
+        ],
+    )
+    def test_sort_by_registers_expected_func(
+        self, sort_by: str, expected: styling.SortTasksFunc
+    ) -> None:
+        register_builtin_organization(None, sort_by)
+
+        assert [reg.func for reg in styling._sort_tasks_funcs] == [expected]
+        assert styling._group_tasks_funcs == []
+
+    @pytest.mark.parametrize("value", [None, "none", "yaml_order", "bogus"])
+    def test_unrecognized_values_register_nothing(self, value: str | None) -> None:
+        register_builtin_organization(value, value)
+
+        assert styling._group_tasks_funcs == []
+        assert styling._sort_tasks_funcs == []

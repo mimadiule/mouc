@@ -18,6 +18,9 @@ WCAG_LUMINANCE_THRESHOLD = 0.03928  # WCAG luminance calculation threshold
 WCAG_CONTRAST_MIDPOINT = 0.5  # Luminance midpoint for contrast determination
 HSL_LIGHTNESS_MIDPOINT = 0.5  # HSL lightness midpoint for color conversion
 
+# Priority for built-in registered functions (lower than user functions, which default to 10)
+BUILTIN_PRIORITY = 5
+
 
 # ============================================================================
 # Public Protocols
@@ -284,6 +287,30 @@ _sort_tasks_funcs: list[StylerRegistration[SortTasksFunc]] = []
 
 # Entity filtering registry
 _filter_entity_funcs: list[StylerRegistration[FilterEntityFunc]] = []
+
+
+def _replace_builtin_registrations(
+    registry: list[StylerRegistration[_F]], output_format: str, func: _F | None = None
+) -> None:
+    """Drop a format's built-in registrations from a registry, optionally adding a new one.
+
+    Built-ins are identified by BUILTIN_PRIORITY plus a format filter naming
+    output_format, so registrations for other formats and all user functions survive.
+    Clearing first keeps repeated registration in one process from accumulating
+    duplicates.
+
+    Args:
+        registry: Registry list to update in place
+        output_format: Output format whose built-in registrations are replaced
+        func: Function to register for that format at BUILTIN_PRIORITY, if any
+    """
+    registry[:] = [
+        reg
+        for reg in registry
+        if reg.priority != BUILTIN_PRIORITY or (reg.formats and output_format not in reg.formats)
+    ]
+    if func is not None:
+        registry.append(StylerRegistration(BUILTIN_PRIORITY, [output_format], None, func))
 
 
 # ============================================================================
@@ -637,11 +664,15 @@ def group_tasks(
     formats: list[str] | None = None,
     tags: list[str] | None = None,
 ) -> GroupTasksFunc | Callable[[GroupTasksFunc], GroupTasksFunc]:
-    """Register a task grouping function for gantt charts.
+    """Register a task grouping function for gantt sections and graph clusters.
 
     The function receives a list of entities and context, and returns
-    a dict mapping section names to entity lists. Dict insertion order determines
+    a dict mapping group names to entity lists. Dict insertion order determines
     display order.
+
+    The returned grouping drives gantt sections and graph `subgraph cluster_*` boxes.
+    Use formats=['gantt'] or formats=['graph'] to scope a function to one output;
+    an unscoped function affects both.
 
     Only ONE grouping function is active (highest priority wins).
 
@@ -656,9 +687,10 @@ def group_tasks(
               with '!') use AND logic (all must be absent).
 
     Return dict mapping:
-        - Keys: Section names (str) or None for no section
-        - Values: Lists of entities to include in that section
-        - Dict order determines section display order
+        - Keys: Group names (str), or None for no gantt section / no graph cluster
+        - Values: Lists of entities to include in that group
+        - Dict order determines section/cluster display order
+        - Entities omitted from the dict are omitted from the output
 
     Examples:
         @group_tasks(formats=['gantt'])
@@ -670,6 +702,21 @@ def group_tasks(
                     groups[milestone] = []
                 groups[milestone].append(entity)
             return groups  # dict order = display order
+
+        @group_tasks(formats=['graph'])
+        def cluster_by_repo(entities, context):
+            groups = {}
+            unclustered = []
+            for entity in entities:
+                repo = entity.meta.get('repo')
+                if repo:
+                    groups.setdefault(repo, []).append(entity)
+                else:
+                    unclustered.append(entity)
+            result = dict(sorted(groups.items()))
+            if unclustered:
+                result[None] = unclustered  # rendered outside all clusters
+            return result
 
         @group_tasks(priority=20)
         def group_by_team(entities, context):
@@ -1221,6 +1268,39 @@ def apply_entity_filters(entities: Sequence[Entity], context: StylingContext) ->
     return result
 
 
+def _select_winning_func(
+    registry: list[StylerRegistration[_F]], context: StylingContext
+) -> _F | None:
+    """Select the highest-priority registered function matching the context's format and tags.
+
+    Args:
+        registry: Registry of single-winner registrations
+        context: Styling context
+
+    Returns:
+        The winning function, or None if the registry has no match
+    """
+    for reg in sorted(registry, key=lambda x: x.priority, reverse=True):
+        if reg.formats is not None and context.output_format not in reg.formats:
+            continue
+        if not _tags_match(reg.tags, context.style_tags):
+            continue
+        return reg.func
+    return None
+
+
+def active_grouping_func(context: StylingContext) -> GroupTasksFunc | None:
+    """Return the grouping function apply_task_grouping would use, or None if there is none.
+
+    Args:
+        context: Styling context
+
+    Returns:
+        The winning grouping function, or None if no registration matches
+    """
+    return _select_winning_func(_group_tasks_funcs, context)
+
+
 def apply_task_grouping(
     entities: Sequence[Entity], context: StylingContext
 ) -> dict[str | None, list[Entity]]:
@@ -1235,24 +1315,10 @@ def apply_task_grouping(
     Returns:
         Dict mapping section names (or None) to entity lists
     """
-    # Sort by priority (higher numbers first for grouping - highest priority wins)
-    funcs = sorted(_group_tasks_funcs, key=lambda x: x.priority, reverse=True)
-    active_tags = context.style_tags
-
-    # Find and apply highest priority function that matches format and tags
-    for reg in funcs:
-        # Skip if format filter is set and doesn't match
-        if reg.formats is not None and context.output_format not in reg.formats:
-            continue
-        # Skip if tags specified but none match active tags
-        if not _tags_match(reg.tags, active_tags):
-            continue
-
-        # Apply this function and return
-        return reg.func(entities, context)
-
-    # No grouping function registered or matched - return single group
-    return {None: list(entities)}
+    func = active_grouping_func(context)
+    if func is None:
+        return {None: list(entities)}
+    return func(entities, context)
 
 
 def apply_task_sorting(entities: Sequence[Entity], context: StylingContext) -> list[Entity]:
@@ -1267,24 +1333,10 @@ def apply_task_sorting(entities: Sequence[Entity], context: StylingContext) -> l
     Returns:
         Sorted list of entities
     """
-    # Sort by priority (higher numbers first for sorting - highest priority wins)
-    funcs = sorted(_sort_tasks_funcs, key=lambda x: x.priority, reverse=True)
-    active_tags = context.style_tags
-
-    # Find and apply highest priority function that matches format and tags
-    for reg in funcs:
-        # Skip if format filter is set and doesn't match
-        if reg.formats is not None and context.output_format not in reg.formats:
-            continue
-        # Skip if tags specified but none match active tags
-        if not _tags_match(reg.tags, active_tags):
-            continue
-
-        # Apply this function and return
-        return reg.func(entities, context)
-
-    # No sorting function registered or matched - return entities unchanged
-    return list(entities)
+    func = _select_winning_func(_sort_tasks_funcs, context)
+    if func is None:
+        return list(entities)
+    return func(entities, context)
 
 
 # ============================================================================
@@ -1461,6 +1513,7 @@ __all__ = [
     "apply_label_styles",
     "apply_task_styles",
     "apply_metadata_styles",
+    "active_grouping_func",
     "apply_task_grouping",
     "apply_task_sorting",
     "apply_entity_filters",

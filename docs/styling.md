@@ -7,6 +7,7 @@ The Mouc styling system allows you to customize the appearance of graph visualiz
 - [Quick Start](#quick-start)
 - [Basic Usage](#basic-usage)
 - [Writing Style Functions](#writing-style-functions)
+  - [Grouping (Gantt Sections and Graph Clusters)](#grouping-gantt-sections-and-graph-clusters)
   - [Entity Filtering](#entity-filtering)
 - [API Reference](#api-reference)
 - [Tag-Based Filtering](#tag-based-filtering)
@@ -346,6 +347,47 @@ If no task stylers are registered, gantt charts use the default behavior:
 - Tasks with `status: done` are marked with the `done` tag
 - Tasks that are late (past deadline) are marked with the `crit` tag
 - Unassigned tasks are marked with the `active` tag
+
+### Grouping (Gantt Sections and Graph Clusters)
+
+Grouping functions return a dict mapping group names to entity lists. The same function drives **gantt sections** and **graph `subgraph cluster_*` boxes**:
+
+```python
+from mouc.styling import group_tasks
+
+@group_tasks(formats=['graph'])
+def cluster_by_repo(entities, context):
+    """Cluster graph nodes by their home repository."""
+    groups = {}
+    unclustered = []
+    for entity in entities:
+        repo = entity.meta.get('repo')
+        if repo:
+            groups.setdefault(repo, []).append(entity)
+        else:
+            unclustered.append(entity)
+    result = dict(sorted(groups.items()))  # dict order = cluster order
+    if unclustered:
+        result[None] = unclustered  # rendered outside all clusters
+    return result
+```
+
+- Keys are group names; the `None` key means "no gantt section" / "no graph cluster" (those nodes render at the top level of the graph, outside every cluster box).
+- Dict insertion order controls section/cluster display order.
+- Entities omitted from the returned dict are omitted from the output.
+- Only one grouping function is active: the highest-priority registration matching the output format and active style tags.
+- Scope with `formats=['gantt']` or `formats=['graph']`; a function registered without `formats` affects **both** gantt sections and graph clusters.
+- The `--view timeline` graph view has its own timeframe clusters and ignores grouping functions.
+
+For simple field-based graph clusters there is a CLI shortcut that registers a built-in grouping function for you (priority 5, so the functions above override it):
+
+```bash
+mouc graph feature_map.yaml --cluster-by meta.repo
+```
+
+`--cluster-by` takes a dotted entity field path. List values cluster by their first entry, entities without a value render outside all clusters, and a value that is neither missing nor a scalar (a dict, set, or tuple) is an error.
+
+When a grouping function outranks the shortcut, `--cluster-by` is inert: the flag's path is not resolved at all, so it produces neither clusters, warnings, nor errors.
 
 ### Entity Filtering
 

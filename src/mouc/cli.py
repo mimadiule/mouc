@@ -18,6 +18,7 @@ from ruamel.yaml import YAML
 
 from . import context, styling
 from .backends import DocxBackend, MarkdownBackend
+from .builtin_graph import register_builtin_clustering, resolve_cluster_value
 from .document import DocumentGenerator
 from .exceptions import MoucError
 from .gantt import GanttScheduler, ScheduledTask, ScheduleResult
@@ -108,6 +109,47 @@ def main_callback(
     context.set_config_path(config)
 
 
+def _render_filtered_graph(
+    feature_map: FeatureMap, styling_context: styling.StylingContext, spec: TagFilterSpec
+) -> str:
+    """Render --view filtered: drop negated entities up front, forward positive tags."""
+    # TODO(unify-filtered-view-warning): this inline check diverges from _select_tag_entities.
+    # Future special-cased views that bypass _apply_tag_filter must duplicate and maintain it.
+    # Emit empty-match warning when no entities survive both positive-tag match and negation.
+    if spec.include and not any(
+        (set(e.tags) & spec.include) and not (set(e.tags) & spec.exclude)
+        for e in feature_map.entities
+    ):
+        typer.echo("warning: --tags matched no entities", err=True)
+
+    excl = spec.exclude
+    negation_ids = (
+        {e.id for e in feature_map.entities if not (set(e.tags) & excl)} if excl else None
+    )
+    with _install_ephemeral_filter(negation_ids):
+        generator = GraphGenerator(feature_map, styling_context)
+        return generator.generate(GraphView.FILTERED, tags=list(spec.include) or None)
+
+
+def _has_cluster_value(entity: Entity, segments: list[str]) -> bool:
+    """Whether the --cluster-by path resolves to anything for this entity.
+
+    An unusable value counts as a value: the path does resolve, so the no-match
+    warning does not apply, and generation reports the error if and only if the
+    entity survives filtering.
+    """
+    try:
+        return resolve_cluster_value(entity, segments) is not None
+    except ValueError:
+        return True
+
+
+def _warn_unmatched_cluster_path(feature_map: FeatureMap, segments: list[str]) -> None:
+    """Warn on stderr when no entity resolves a value for the --cluster-by path."""
+    if not any(_has_cluster_value(e, segments) for e in feature_map.entities):
+        typer.echo("warning: --cluster-by matched no entities", err=True)
+
+
 @app.command()
 def graph(  # noqa: PLR0913 - CLI command needs multiple options
     file: Annotated[Path, typer.Argument(help="Path to the feature map YAML file")] = Path(
@@ -154,6 +196,18 @@ def graph(  # noqa: PLR0913 - CLI command needs multiple options
             help="Comma-separated tags to enable styling functions (merged with config)",
         ),
     ] = None,
+    cluster_by: Annotated[
+        str | None,
+        typer.Option(
+            "--cluster-by",
+            help=(
+                "Group nodes into subgraph clusters by a dotted entity field path "
+                "(e.g. meta.repo). Shortcut for a built-in @group_tasks function; a "
+                "user grouping function overrides it. List values cluster by their "
+                "first entry; entities without a value render outside all clusters."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Generate dependency graphs in DOT format."""
     # Validate arguments
@@ -167,6 +221,10 @@ def graph(  # noqa: PLR0913 - CLI command needs multiple options
 
     if style_module and style_file:
         typer.echo("Error: Cannot specify both --style-module and --style-file", err=True)
+        raise typer.Exit(1)
+
+    if cluster_by and view == GraphView.TIMELINE:
+        typer.echo("Error: --cluster-by cannot be combined with --view timeline", err=True)
         raise typer.Exit(1)
 
     # Parse tag filter spec; for --view filtered, reject empty or negation-only specs.
@@ -190,33 +248,21 @@ def graph(  # noqa: PLR0913 - CLI command needs multiple options
         feature_map, output_format="graph", style_tags=active_style_tags
     )
 
-    # For --view filtered: install a negation-only ephemeral filter (removes excluded entities
-    # from base_entities before _generate_filtered runs), then forward only positive tags.
-    # For all other views: install the full closure-based ephemeral filter.
-    graph_tags: list[str] | None = tags
-    if view == GraphView.FILTERED and not spec.is_empty:
-        # TODO(unify-filtered-view-warning): this inline check diverges from _select_tag_entities.
-        # Future special-cased views that bypass _apply_tag_filter must duplicate and maintain it.
-        # Emit empty-match warning when no entities survive both positive-tag match and negation.
-        if spec.include and not any(
-            (set(e.tags) & spec.include) and not (set(e.tags) & spec.exclude)
-            for e in feature_map.entities
-        ):
-            typer.echo("warning: --tags matched no entities", err=True)
-        # Negation-only filter: exclude tagged entities; positive tags forwarded as-is.
-        excl = spec.exclude
-        negation_ids = (
-            {e.id for e in feature_map.entities if not (set(e.tags) & excl)} if excl else None
-        )
-        graph_tags = list(spec.include) or None
-        with _install_ephemeral_filter(negation_ids):
-            generator = GraphGenerator(feature_map, styling_context)
-            dot_output = generator.generate(view, target=target, tags=graph_tags)
-    else:
-        with _apply_tag_filter(feature_map, spec):
-            # Generate the graph
-            generator = GraphGenerator(feature_map, styling_context)
-            dot_output = generator.generate(view, target=target, tags=graph_tags)
+    try:
+        clustering = register_builtin_clustering(cluster_by)
+        # Skip the scan when a user grouping function outranks the built-in: the flag
+        # has no effect on the output, so neither its warning nor its errors apply.
+        if clustering and styling.active_grouping_func(styling_context) is clustering.func:
+            _warn_unmatched_cluster_path(feature_map, clustering.segments)
+        if view == GraphView.FILTERED and not spec.is_empty:
+            dot_output = _render_filtered_graph(feature_map, styling_context, spec)
+        else:
+            with _apply_tag_filter(feature_map, spec):
+                generator = GraphGenerator(feature_map, styling_context)
+                dot_output = generator.generate(view, target=target, tags=tags)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1) from e
 
     # Output the result
     if output:

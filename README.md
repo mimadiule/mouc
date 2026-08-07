@@ -252,6 +252,14 @@ def color_by_status(entity, context):
 mouc graph --style-file ./my_styles.py
 ```
 
+Graph nodes can also be boxed into `subgraph cluster_*` groups by any entity field:
+
+```bash
+mouc graph --cluster-by meta.repo
+```
+
+List values cluster by their first entry, and entities without a value for the field render outside all clusters. For computed cluster keys or custom cluster order, write a `@group_tasks` function instead; such a function overrides the flag, which then has no effect at all.
+
 See [docs/styling.md](docs/styling.md) for the full API.
 
 ### Configuration
