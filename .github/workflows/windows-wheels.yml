@@ -54,6 +54,7 @@ jobs:
       - name: Publish Windows wheels
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           if ! gh release view windows-latest >/dev/null 2>&1; then
             gh release create windows-latest \
