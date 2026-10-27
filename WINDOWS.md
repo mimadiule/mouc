@@ -18,7 +18,7 @@
 打开：
 
 ```text
-https://github.com/mimadiule/mouc/releases
+https://github.com/mimadiule/mouc/releases/tag/windows-latest
 ```
 
 选择与你的 Python 版本匹配的文件：
