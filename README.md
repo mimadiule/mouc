@@ -1,3 +1,13 @@
+> **Windows build fork / Windows 构建分支**
+>
+> 这是 [`rnortman/mouc`](https://github.com/rnortman/mouc) 的 Windows 构建分支。
+> Windows 用户不需要安装 Rust，直接下载预先编译好的 wheel：
+> [Windows wheels](https://github.com/mimadiule/mouc/releases/tag/windows-latest)。
+> 安装步骤、Python 版本对照和自行编译说明见 [WINDOWS.md](WINDOWS.md)。
+>
+> This fork publishes prebuilt Windows x64 wheels for Python 3.10–3.13.
+> See [WINDOWS.md](WINDOWS.md) before installing from source.
+
 # Mouc
 
 A YAML-based dependency tracker and automatic scheduler for project roadmaps.
