@@ -127,3 +127,20 @@ maturin build --release --out dist -i python
 - 上游 README：`README.md`
 - 构建 workflow：`.github/workflows/windows-wheels.yml`
 - License：`LICENSE`
+
+## 验证状态
+
+2026-10-27 已验证：
+
+- GitHub Actions `windows-latest` 构建成功：Python 3.10、3.11、3.12、3.13；
+- 自动 `release` job 成功，wheel 已上传到 `windows-latest` release；
+- Windows 本机用 `cp310` wheel 验证：
+  - `import mouc.rust` 成功；
+  - `mouc --help` 成功；
+  - `mouc gantt` 能正常生成 Mermaid 甘特图。
+
+对应 workflow run：
+
+```text
+https://github.com/mimadiule/mouc/actions/runs/40470516740
+```
