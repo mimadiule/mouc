@@ -44,6 +44,12 @@ uv pip install mouc   # recommended
 pip install mouc
 ```
 
+> **Windows users:** upstream PyPI currently ships manylinux wheels only.
+> This fork publishes prebuilt Windows x64 wheels in
+> [Releases](https://github.com/mimadiule/mouc/releases).
+> See [WINDOWS.md](WINDOWS.md) for Python-version compatibility,
+> installation, verification, and how to rebuild the wheel with GitHub Actions.
+
 ## Quick Example
 
 Create `feature_map.yaml`:
